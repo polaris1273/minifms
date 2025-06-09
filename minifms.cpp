@@ -198,10 +198,10 @@ private:
         // 检查文件是否被锁定
         if (fcb.locked)
         {
-            // 如果是写操作，只有锁定者可以修改
-            if (needWrite && fcb.lockOwner != session->user->userId)
+            // 如果是写操作，任何用户都不能修改
+            if (needWrite)
             {
-                cout << " 错误：文件已被锁定，无法修改" << endl;
+                cout << " 错误：文件已被锁定，处于只读状态" << endl;
                 cout << " - 当前锁定者：";
                 for (int i = 0; i < MAX_USERS; i++)
                 {
@@ -297,6 +297,78 @@ public:
     bool importFile(Session *session, const string &externalPath, const string &internalName);
     // 导出文件到外部文件系统
     bool exportFile(Session *session, const string &internalName, const string &externalPath);
+
+    // 通过路径查找FCB
+    int findFCBByPath(Session *session, const string &path)
+    {
+        if (!session || !sharedData)
+            return -1;
+        if (path.empty())
+            return -1;
+
+        // 处理特殊路径
+        if (path == "/")
+        {
+            return session->user->rootDirId; // 返回用户的根目录
+        }
+
+        // 确定起始目录
+        int currentDir = session->currentDirId;
+
+        // 分割路径
+        vector<string> parts;
+        stringstream ss(path);
+        string part;
+
+        // 检查是否是绝对路径
+        bool isAbsolutePath = !path.empty() && path[0] == '/';
+        if (isAbsolutePath)
+        {
+            currentDir = session->user->rootDirId;
+        }
+
+        // 使用/分割路径
+        while (getline(ss, part, '/'))
+        {
+            if (part.empty() || part == ".")
+                continue; // 跳过空部分和当前目录符号
+            parts.push_back(part);
+        }
+
+        if (parts.empty())
+            return currentDir;
+
+        // 遍历路径的每一部分
+        for (const string &dirName : parts)
+        {
+            if (dirName == "..")
+            {
+                // 返回上级目录
+                if (currentDir == session->user->rootDirId)
+                {
+                    // 已经在根目录，无法再往上
+                    continue;
+                }
+                FCB &currentFCB = sharedData->fcbs[currentDir];
+                currentDir = currentFCB.parentDir;
+                if (currentDir == -1)
+                {
+                    return -1; // 无效的父目录
+                }
+            }
+            else
+            {
+                int nextId = findFCB(currentDir, dirName);
+                if (nextId == -1)
+                {
+                    return -1; // 路径中的某个部分不存在
+                }
+                currentDir = nextId;
+            }
+        }
+
+        return currentDir;
+    }
 };
 
 // 构造函数和析构函数定义
@@ -853,8 +925,7 @@ void MiniFMS::processCommand(CommandRequest &req)
     iss >> cmd;
     string arg;
     while (iss >> arg)
-        args.push_back(arg);
-
+        args.push_back(arg); // 将命令行参数分割成多个字符串
     if (cmd == "help")
     {
         showHelp();
@@ -1352,38 +1423,82 @@ void MiniFMS::processCommand(CommandRequest &req)
     {
         if (args.size() < 2)
         {
-            cout << " 用法: copy [源文件] [目标文件]" << endl;
+            cout << " 用法: copy [源文件名] [目标目录路径]" << endl;
+            cout << " 支持的路径格式：" << endl;
+            cout << "   - 相对路径: docs/backup/     # 当前目录下的子目录" << endl;
+            cout << "   - 上级目录: ../backup/       # 返回上级目录" << endl;
+            cout << "   - 绝对路径: /docs/backup/    # 从根目录开始" << endl;
+            cout << "   - 当前目录: ./backup/        # 当前目录" << endl;
         }
         else
         {
+            // 检查源文件是否存在
             int srcId = findFCB(req.session->currentDirId, args[0]);
             if (srcId == -1 || sharedData->fcbs[srcId].type != 0)
             {
                 cout << " 源文件不存在: " << args[0] << endl;
+                return;
             }
-            else if (findFCB(req.session->currentDirId, args[1]) != -1)
+
+            // 解析目标路径
+            string targetPath = args[1];
+            if (targetPath.empty())
             {
-                cout << " 目标文件已存在: " << args[1] << endl;
+                cout << " 错误：目标路径不能为空" << endl;
+                return;
+            }
+
+            // 确保路径以/结尾
+            if (targetPath[targetPath.length() - 1] != '/')
+            {
+                targetPath += '/';
+            }
+
+            // 移除末尾的/并查找目标目录
+            string pathForSearch = targetPath.substr(0, targetPath.length() - 1);
+            int targetDirId = findFCBByPath(req.session, pathForSearch);
+            if (targetDirId == -1)
+            {
+                cout << " 目标目录不存在: " << pathForSearch << endl;
+                return;
+            }
+
+            // 确认是目录
+            if (sharedData->fcbs[targetDirId].type != 1)
+            {
+                cout << " 错误：" << pathForSearch << " 不是一个目录" << endl;
+                return;
+            }
+
+            // 检查目标目录中是否已存在同名文件
+            if (findFCB(targetDirId, args[0]) != -1)
+            {
+                cout << " 目标目录中已存在同名文件: " << args[0] << endl;
+                return;
+            }
+
+            // 在目标目录中创建新文件
+            int newFileId = createFCB(args[0], 0, req.session->user->userId, targetDirId);
+            if (newFileId != -1)
+            {
+                // 复制文件内容
+                memcpy(sharedData->fileContents[newFileId],
+                       sharedData->fileContents[srcId],
+                       sizeof(sharedData->fileContents[srcId]));
+                sharedData->fcbs[newFileId].size = sharedData->fcbs[srcId].size;
+                sharedData->fcbs[newFileId].modifyTime = time(nullptr);
+
+                cout << " 文件复制成功: " << endl;
+                cout << " - 源文件: " << args[0] << endl;
+                cout << " - 目标位置: " << pathForSearch << "/" << args[0] << endl;
+                cout << " - 文件大小: " << sharedData->fcbs[newFileId].size << " 字节" << endl;
+
+                sharedData->modifyCount++;
+                dataChanged = true;
             }
             else
             {
-                int newFileId = createFCB(args[1], 0, req.session->user->userId, req.session->currentDirId);
-                if (newFileId != -1)
-                {
-                    memcpy(sharedData->fileContents[newFileId],
-                           sharedData->fileContents[srcId],
-                           sizeof(sharedData->fileContents[srcId]));
-                    sharedData->fcbs[newFileId].size = sharedData->fcbs[srcId].size;
-                    sharedData->fcbs[newFileId].modifyTime = time(nullptr);
-
-                    cout << " 文件复制成功: " << args[0] << " -> " << args[1] << endl;
-                    sharedData->modifyCount++;
-                    dataChanged = true;
-                }
-                else
-                {
-                    cout << " 文件复制失败" << endl;
-                }
+                cout << " 文件复制失败" << endl;
             }
         }
     }
@@ -1391,27 +1506,70 @@ void MiniFMS::processCommand(CommandRequest &req)
     {
         if (args.size() < 2)
         {
-            cout << " 用法: move [源文件] [目标文件]" << endl;
+            cout << " 用法: move [源文件名] [目标目录路径]" << endl;
+            cout << " 支持的路径格式：" << endl;
+            cout << "   - 相对路径: docs/backup/     # 当前目录下的子目录" << endl;
+            cout << "   - 上级目录: ../backup/       # 返回上级目录" << endl;
+            cout << "   - 绝对路径: /docs/backup/    # 从根目录开始" << endl;
+            cout << "   - 当前目录: ./backup/        # 当前目录" << endl;
         }
         else
         {
+            // 检查源文件是否存在
             int srcId = findFCB(req.session->currentDirId, args[0]);
             if (srcId == -1 || sharedData->fcbs[srcId].type != 0)
             {
                 cout << " 源文件不存在: " << args[0] << endl;
+                return;
             }
-            else if (findFCB(req.session->currentDirId, args[1]) != -1)
+
+            // 解析目标路径
+            string targetPath = args[1];
+            if (targetPath.empty())
             {
-                cout << " 目标文件已存在: " << args[1] << endl;
+                cout << " 错误：目标路径不能为空" << endl;
+                return;
             }
-            else
+
+            // 确保路径以/结尾
+            if (targetPath[targetPath.length() - 1] != '/')
             {
-                strncpy(sharedData->fcbs[srcId].name, args[1].c_str(), MAX_FILENAME_LEN - 1);
-                sharedData->fcbs[srcId].modifyTime = time(nullptr);
-                cout << " 文件移动成功: " << args[0] << " -> " << args[1] << endl;
-                sharedData->modifyCount++;
-                dataChanged = true;
+                targetPath += '/';
             }
+
+            // 移除末尾的/并查找目标目录
+            string pathForSearch = targetPath.substr(0, targetPath.length() - 1);
+            int targetDirId = findFCBByPath(req.session, pathForSearch);
+            if (targetDirId == -1)
+            {
+                cout << " 目标目录不存在: " << pathForSearch << endl;
+                return;
+            }
+
+            // 确认是目录
+            if (sharedData->fcbs[targetDirId].type != 1)
+            {
+                cout << " 错误：" << pathForSearch << " 不是一个目录" << endl;
+                return;
+            }
+
+            // 检查目标目录中是否已存在同名文件
+            if (findFCB(targetDirId, args[0]) != -1)
+            {
+                cout << " 目标目录中已存在同名文件: " << args[0] << endl;
+                return;
+            }
+
+            // 移动文件（更新父目录）
+            sharedData->fcbs[srcId].parentDir = targetDirId;
+            sharedData->fcbs[srcId].modifyTime = time(nullptr);
+
+            cout << " 文件移动成功: " << endl;
+            cout << " - 源文件: " << args[0] << endl;
+            cout << " - 目标位置: " << pathForSearch << "/" << args[0] << endl;
+
+            sharedData->modifyCount++;
+            dataChanged = true;
         }
     }
     else if (cmd == "flock")
@@ -1419,9 +1577,10 @@ void MiniFMS::processCommand(CommandRequest &req)
         if (args.empty())
         {
             cout << " 用法: flock [文件名]" << endl;
-            cout << " 功能: 锁定/解锁文件，防止其他用户修改" << endl;
-            cout << " 说明: - 锁定的文件只能被锁定者修改" << endl;
-            cout << "       - 其他用户仍可以读取文件" << endl;
+            cout << " 功能: 锁定/解锁文件，将文件设置为只读状态" << endl;
+            cout << " 说明: - 锁定的文件所有用户（包括锁定者）都只能读取" << endl;
+            cout << "       - 任何用户都不能修改锁定的文件" << endl;
+            cout << "       - 只有锁定者可以解锁文件" << endl;
             cout << "       - 使用相同命令可以解锁文件" << endl;
         }
         else
@@ -1457,7 +1616,7 @@ void MiniFMS::processCommand(CommandRequest &req)
                         // 显示文件状态
                         cout << " 当前状态：" << endl;
                         cout << " - 锁定状态：未锁定" << endl;
-                        cout << " - 其他用户现在可以修改此文件" << endl;
+                        cout << " - 文件现在可以读写" << endl;
                     }
                     else
                     {
@@ -1473,6 +1632,7 @@ void MiniFMS::processCommand(CommandRequest &req)
                             }
                         }
                         cout << " - 锁定时间：" << formatTime(fcb.modifyTime) << endl;
+                        cout << " - 文件处于只读状态" << endl;
                     }
                 }
                 else
@@ -1489,10 +1649,10 @@ void MiniFMS::processCommand(CommandRequest &req)
 
                     // 显示文件状态
                     cout << " 当前状态：" << endl;
-                    cout << " - 锁定状态：已锁定" << endl;
+                    cout << " - 锁定状态：已锁定（只读）" << endl;
                     cout << " - 锁定者：" << req.session->user->username << endl;
                     cout << " - 锁定时间：" << formatTime(fcb.modifyTime) << endl;
-                    cout << " - 其他用户仍可以读取此文件，但不能修改" << endl;
+                    cout << " - 所有用户（包括锁定者）只能读取此文件" << endl;
                 }
 
                 // 标记数据已修改
