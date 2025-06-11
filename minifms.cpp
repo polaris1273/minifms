@@ -25,7 +25,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/file.h>
+#include <semaphore.h>
+#include <errno.h>
 #endif
 
 using namespace std;
@@ -34,13 +35,20 @@ using namespace std;
 #define VERSION "2.0"
 #define MAX_USERS 100
 #define MAX_FCBS 10000
-#define MAX_FILENAME_LEN 64
-#define MAX_BLOCKS 9216 // 最大块数
+#define MAX_FILENAME_LEN 64 // 文件名最大长度
+#define MAX_BLOCKS 9216     // 最大块数
+
+// 进程间通信常量
+#define SHARED_MEMORY_SIZE (sizeof(SharedData))
+#define SHARED_MEMORY_NAME "MiniFMS_SharedMemory"
+#define SHARED_MUTEX_NAME "MiniFMS_Mutex"
+#define CHANGE_EVENT_NAME "MiniFMS_ChangeEvent"
+#define MAX_PROCESSES 10
 
 // 用户结构体
 struct User
 {
-    int isused = 0;
+    int isused = 0; // 标记该用户是否登陆
     char username[32];
     char password[32];
     bool locked = false;
@@ -50,23 +58,24 @@ struct User
     time_t createTime;
     int userId;
 
+    // 构造函数（创建user时，初始化username和password数组为0）
     User()
     {
         memset(username, 0, sizeof(username));
         memset(password, 0, sizeof(password));
-        createTime = time(nullptr);
+        createTime = time(nullptr); // 获取系统时间
     }
 };
 
 // 文件控制块FCB
 struct FCB
 {
-    int isused = 0;
+    int isused = 0; // 标记该文件是否被使用
     char name[MAX_FILENAME_LEN];
     int type = 0; // 0=文件，1=目录
     int owner = 0;
     size_t size = 0;
-    int address = 0;
+    int address = 0; // 文件在二进制文件中的起始地址
     time_t createTime;
     time_t modifyTime;
     time_t accessTime;
@@ -81,13 +90,13 @@ struct FCB
     }
 };
 
-// 文件描述符结构（避免与Windows OpenFile冲突）
+// 文件描述符结构（open打开文件时，需要记录文件的id、用户id、文件位置、文件模式）
 struct FileDesc
 {
     int fcbId = -1;
     int userId = -1;
-    size_t position = 0;
-    int mode = 0;
+    size_t position = 0; // 文件在二进制文件中的起始地址
+    int mode = 0;        // 文件打开模式
     bool isOpen = false;
 
     FileDesc() = default;
@@ -105,11 +114,22 @@ struct SharedData
     char fileContents[MAX_FCBS][4096];
     bool initialized = false;
 
+    // 进程间同步字段
+    atomic<int> processCount{0};
+    atomic<int> lastChangeId{0};
+    char processNames[MAX_PROCESSES][64];
+    atomic<bool> processActive[MAX_PROCESSES];
+
     SharedData()
     {
         for (int i = 0; i < MAX_FCBS; ++i)
         {
             memset(fileContents[i], 0, sizeof(fileContents[i]));
+        }
+        for (int i = 0; i < MAX_PROCESSES; ++i)
+        {
+            memset(processNames[i], 0, sizeof(processNames[i]));
+            processActive[i] = false;
         }
     }
 };
@@ -161,33 +181,39 @@ struct CommandRequest
 class MiniFMS
 {
 private:
-    SharedData *sharedData = nullptr;
-    atomic<bool> systemRunning{true};
-    atomic<bool> shouldExit{false};
+    SharedData *sharedData = nullptr; // 共享数据（用户、文件、文件内容）
+    atomic<bool> systemRunning{true}; // 系统运行标志，true运行，false退出
+    atomic<bool> shouldExit{false};   // 退出标志，true退出，false运行
 
 #ifdef _WIN32
     HANDLE hMapFile = nullptr;
+    HANDLE hMutex = nullptr;
+    HANDLE hChangeEvent = nullptr;
 #else
     int shmFd = -1;
+    sem_t *mutex = nullptr;
+    sem_t *changeEvent = nullptr;
 #endif
 
-    queue<CommandRequest> commandQueue;
-    mutex queueMutex;
-    condition_variable queueCv;
-    mutex diskMutex;
-    bool ready = false;
+    queue<CommandRequest> commandQueue; // 命令队列
+    mutex queueMutex;                   // 命令队列互斥锁
+    condition_variable queueCv;         // 命令队列条件变量
+    mutex diskMutex;                    // 本地文件互斥锁
+    bool ready = false;                 // 是否就绪判断
 
     // 持久化相关变量
-    const string DATA_FILE = "filesystem.dat";
-    atomic<bool> dataChanged{false};
-    thread autoSaveThreadHandle;
-    thread diskMaintenanceThreadHandle;
+    const string DATA_FILE = "filesystem.dat"; // 本地文件名
+    atomic<bool> dataChanged{false};           // 数据是否改变，发生变化自动保存
+    thread autoSaveThreadHandle;               // 自动保存线程
+    thread diskMaintenanceThreadHandle;        // 磁盘维护线程
+    thread syncThreadHandle;                   // 同步监听线程
 
-    Session currentSession;
+    Session currentSession; // 当前会话
 
-    int *fatBlock = nullptr;
-    int *bitMap = nullptr;
+    int *fatBlock = nullptr; // FAT表，记录文件的地址
+    int *bitMap = nullptr;   // 位图，记录文件是否被使用
 
+    // 检查文件访问权限
     bool checkFileAccess(Session *session, int fileId, bool needWrite)
     {
         if (!session || !sharedData || fileId < 0 || fileId >= MAX_FCBS)
@@ -228,7 +254,7 @@ private:
         // 通知所有等待的线程
         queueCv.notify_all();
 
-        // 等待自动保存线程和磁盘维护线程结束
+        // 等待自动保存线程和磁盘更新线程结束
         if (autoSaveThreadHandle.joinable())
         {
             autoSaveThreadHandle.join();
@@ -244,9 +270,7 @@ private:
             saveDataToDisk(false);
         }
 
-        // 清理共享数据
-        delete sharedData;
-        sharedData = nullptr;
+        // 不需要删除共享数据，因为它在共享内存中
 
         // 清理 FAT 表和位图
         delete[] fatBlock;
@@ -298,84 +322,39 @@ public:
     // 导出文件到外部文件系统
     bool exportFile(Session *session, const string &internalName, const string &externalPath);
 
+    // 进程间通信方法
+    bool initSharedMemory();
+    bool connectToSharedMemory();
+    bool acquireProcessSlot();
+    void releaseProcessSlot();
+    void lockSharedMemory();
+    void unlockSharedMemory();
+    void notifyDataChange();
+    void syncDataChangeThread();
+    void broadcastMessage(const string &message);
+    void showConnectedProcesses();
+
     // 通过路径查找FCB
-    int findFCBByPath(Session *session, const string &path)
-    {
-        if (!session || !sharedData)
-            return -1;
-        if (path.empty())
-            return -1;
+    int findFCBByPath(Session *session, const string &path);
 
-        // 处理特殊路径
-        if (path == "/")
-        {
-            return session->user->rootDirId; // 返回用户的根目录
-        }
-
-        // 确定起始目录
-        int currentDir = session->currentDirId;
-
-        // 分割路径
-        vector<string> parts;
-        stringstream ss(path);
-        string part;
-
-        // 检查是否是绝对路径
-        bool isAbsolutePath = !path.empty() && path[0] == '/';
-        if (isAbsolutePath)
-        {
-            currentDir = session->user->rootDirId;
-        }
-
-        // 使用/分割路径
-        while (getline(ss, part, '/'))
-        {
-            if (part.empty() || part == ".")
-                continue; // 跳过空部分和当前目录符号
-            parts.push_back(part);
-        }
-
-        if (parts.empty())
-            return currentDir;
-
-        // 遍历路径的每一部分
-        for (const string &dirName : parts)
-        {
-            if (dirName == "..")
-            {
-                // 返回上级目录
-                if (currentDir == session->user->rootDirId)
-                {
-                    // 已经在根目录，无法再往上
-                    continue;
-                }
-                FCB &currentFCB = sharedData->fcbs[currentDir];
-                currentDir = currentFCB.parentDir;
-                if (currentDir == -1)
-                {
-                    return -1; // 无效的父目录
-                }
-            }
-            else
-            {
-                int nextId = findFCB(currentDir, dirName);
-                if (nextId == -1)
-                {
-                    return -1; // 路径中的某个部分不存在
-                }
-                currentDir = nextId;
-            }
-        }
-
-        return currentDir;
-    }
+private:
+    // 进程间通信相关
+    int currentProcessId = -1;
+    atomic<int> lastKnownChangeId{0};
+    string processName;
 };
 
 // 构造函数和析构函数定义
 MiniFMS::MiniFMS()
 {
-    // 初始化共享数据
-    sharedData = new SharedData();
+    // 生成进程名称
+    auto now = chrono::system_clock::now();
+    auto time_t = chrono::system_clock::to_time_t(now);
+#ifdef _WIN32
+    processName = "MiniFMS_" + to_string(time_t) + "_" + to_string(GetCurrentProcessId());
+#else
+    processName = "MiniFMS_" + to_string(time_t) + "_" + to_string(getpid());
+#endif
 
     // 初始化 FAT 表和位图
     fatBlock = new int[MAX_BLOCKS];
@@ -383,37 +362,101 @@ MiniFMS::MiniFMS()
     memset(fatBlock, 0, sizeof(int) * MAX_BLOCKS);
     memset(bitMap, 0, sizeof(int) * MAX_BLOCKS);
 
-    // 尝试从磁盘加载数据
-    if (!loadDataFromDisk())
+    // 尝试连接到共享内存，如果失败则创建新的
+    if (!connectToSharedMemory())
     {
-        cout << "初始化新的文件系统..." << endl;
-        // 初始化根目录
-        FCB &rootFcb = sharedData->fcbs[0];
-        rootFcb.isused = 1;
-        strcpy(rootFcb.name, "/");
-        rootFcb.type = 1;
-        rootFcb.owner = 0;
-        rootFcb.createTime = rootFcb.modifyTime = rootFcb.accessTime = time(nullptr);
-        rootFcb.parentDir = -1;
-        sharedData->nextFcbId = 1;
-        sharedData->initialized = true;
+        if (!initSharedMemory())
+        {
+            throw runtime_error("无法初始化共享内存");
+        }
+    }
 
-        // 为根目录分配第一个数据块
-        bitMap[0] = 1;
-        fatBlock[0] = -1; // 标记为链表结束
-    }
-    else
+    // 获取进程槽位
+    if (!acquireProcessSlot())
     {
-        cout << "从磁盘加载文件系统数据成功!" << endl;
+        throw runtime_error("无法获取进程槽位，系统已满");
     }
+
+    // 如果是第一个进程，初始化文件系统
+    if (sharedData->processCount == 1 && !sharedData->initialized)
+    {
+        // 尝试从磁盘加载数据
+        if (!loadDataFromDisk())
+        {
+            cout << "初始化新的文件系统..." << endl;
+            // 初始化根目录
+            FCB &rootFcb = sharedData->fcbs[0];
+            rootFcb.isused = 1;
+            strcpy(rootFcb.name, "/");
+            rootFcb.type = 1;
+            rootFcb.owner = 0;
+            rootFcb.createTime = rootFcb.modifyTime = rootFcb.accessTime = time(nullptr);
+            rootFcb.parentDir = -1;
+            sharedData->nextFcbId = 1;
+            sharedData->initialized = true;
+
+            // 为根目录分配第一个数据块
+            bitMap[0] = 1;
+            fatBlock[0] = -1; // 标记为链表结束
+        }
+        else
+        {
+            cout << "从磁盘加载文件系统数据成功!" << endl;
+        }
+    }
+    else if (sharedData->initialized)
+    {
+        cout << "连接到现有文件系统 (进程数: " << sharedData->processCount.load() << ")" << endl;
+    }
+
+    // 启动同步监听线程
+    syncThreadHandle = thread(&MiniFMS::syncDataChangeThread, this);
 }
 
 MiniFMS::~MiniFMS()
 {
+    // 释放进程槽位
+    releaseProcessSlot();
+
     // 清理资源
     delete[] fatBlock;
     delete[] bitMap;
     cleanup();
+
+    // 清理同步线程
+    if (syncThreadHandle.joinable())
+    {
+        syncThreadHandle.join();
+    }
+
+#ifdef _WIN32
+    if (hChangeEvent)
+        CloseHandle(hChangeEvent);
+    if (hMutex)
+        CloseHandle(hMutex);
+    if (sharedData)
+        UnmapViewOfFile(sharedData);
+    if (hMapFile)
+        CloseHandle(hMapFile);
+#else
+    if (changeEvent)
+    {
+        sem_close(changeEvent);
+        sem_unlink((CHANGE_EVENT_NAME + processName).c_str());
+    }
+    if (mutex)
+    {
+        sem_close(mutex);
+        sem_unlink(SHARED_MUTEX_NAME);
+    }
+    if (sharedData)
+        munmap(sharedData, SHARED_MEMORY_SIZE);
+    if (shmFd >= 0)
+    {
+        close(shmFd);
+        shm_unlink(SHARED_MEMORY_NAME);
+    }
+#endif
 }
 
 int MiniFMS::findFCB(int parentDir, const string &name)
@@ -473,6 +516,7 @@ int MiniFMS::createFCB(const string &name, int type, int owner, int parentDir)
     sharedData->nextFcbId = fcbId + 1;
     sharedData->modifyCount++;
     dataChanged = true;
+    notifyDataChange();
 
     return fcbId;
 }
@@ -529,6 +573,7 @@ bool MiniFMS::registerUser(const string &username, const string &password)
     // 立即保存数据到磁盘
     sharedData->modifyCount++;
     dataChanged = true;
+    notifyDataChange();
     if (saveDataToDisk(true))
     {
         cout << "用户数据已保存到磁盘" << endl;
@@ -691,6 +736,7 @@ void MiniFMS::showHelp()
     cout << "\n 系统功能:" << endl;
     cout << "  tree                显示目录树" << endl;
     cout << "  save                手动保存数据到磁盘" << endl;
+    cout << "  processes/ps        显示连接的进程" << endl;
     cout << "  help                显示本帮助" << endl;
     cout << "  exit                退出系统" << endl;
     cout << "\n═══════════════════════════════════════\n"
@@ -753,6 +799,7 @@ void MiniFMS::deleteFile(Session *session, const string &fileName)
     cout << "文件删除成功: " << fileName << endl;
     sharedData->modifyCount++;
     dataChanged = true;
+    notifyDataChange();
 }
 
 void MiniFMS::listDirectory(Session *session)
@@ -1907,6 +1954,10 @@ void MiniFMS::processCommand(CommandRequest &req)
         string externalPath = args.size() > 1 ? args[1] : internalName;
         exportFile(req.session, internalName, externalPath);
     }
+    else if (cmd == "processes" || cmd == "ps")
+    {
+        showConnectedProcesses();
+    }
     else
     {
         cout << " " << cmd << ": command not found" << endl;
@@ -2538,11 +2589,416 @@ bool MiniFMS::exportFile(Session *session, const string &internalName, const str
     return true;
 }
 
+// 通过路径查找FCB
+int MiniFMS::findFCBByPath(Session *session, const string &path)
+{
+    if (!session || !sharedData)
+        return -1;
+    if (path.empty())
+        return -1;
+
+    // 处理特殊路径
+    if (path == "/")
+    {
+        return session->user->rootDirId; // 返回用户的根目录
+    }
+
+    // 确定起始目录
+    int currentDir = session->currentDirId;
+
+    // 分割路径
+    vector<string> parts;
+    stringstream ss(path);
+    string part;
+
+    // 检查是否是绝对路径
+    bool isAbsolutePath = !path.empty() && path[0] == '/';
+    if (isAbsolutePath)
+    {
+        currentDir = session->user->rootDirId;
+    }
+
+    // 使用/分割路径
+    while (getline(ss, part, '/'))
+    {
+        if (part.empty() || part == ".")
+            continue; // 跳过空部分和当前目录符号
+        parts.push_back(part);
+    }
+
+    if (parts.empty())
+        return currentDir;
+
+    // 遍历路径的每一部分
+    for (const string &dirName : parts)
+    {
+        if (dirName == "..")
+        {
+            // 返回上级目录
+            if (currentDir == session->user->rootDirId)
+            {
+                // 已经在根目录，无法再往上
+                continue;
+            }
+            FCB &currentFCB = sharedData->fcbs[currentDir];
+            currentDir = currentFCB.parentDir;
+            if (currentDir == -1)
+            {
+                return -1; // 无效的父目录
+            }
+        }
+        else
+        {
+            int nextId = findFCB(currentDir, dirName);
+            if (nextId == -1)
+            {
+                return -1; // 路径中的某个部分不存在
+            }
+            currentDir = nextId;
+        }
+    }
+
+    return currentDir;
+}
+
+// 进程间通信方法实现
+bool MiniFMS::initSharedMemory()
+{
+#ifdef _WIN32
+    // 创建共享内存
+    hMapFile = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        SHARED_MEMORY_SIZE,
+        SHARED_MEMORY_NAME);
+
+    if (hMapFile == NULL)
+    {
+        cerr << "无法创建文件映射: " << GetLastError() << endl;
+        return false;
+    }
+
+    sharedData = (SharedData *)MapViewOfFile(
+        hMapFile,
+        FILE_MAP_ALL_ACCESS,
+        0,
+        0,
+        SHARED_MEMORY_SIZE);
+
+    if (sharedData == NULL)
+    {
+        cerr << "无法映射视图: " << GetLastError() << endl;
+        CloseHandle(hMapFile);
+        hMapFile = NULL;
+        return false;
+    }
+
+    // 创建互斥锁
+    hMutex = CreateMutexA(NULL, FALSE, SHARED_MUTEX_NAME);
+    if (hMutex == NULL)
+    {
+        cerr << "无法创建互斥锁: " << GetLastError() << endl;
+        return false;
+    }
+
+    // 创建事件对象
+    hChangeEvent = CreateEventA(NULL, TRUE, FALSE, CHANGE_EVENT_NAME);
+    if (hChangeEvent == NULL)
+    {
+        cerr << "无法创建事件对象: " << GetLastError() << endl;
+        return false;
+    }
+
+    // 初始化共享数据
+    new (sharedData) SharedData();
+
+#else
+    // Linux实现
+    shmFd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
+    if (shmFd == -1)
+    {
+        cerr << "无法创建共享内存: " << strerror(errno) << endl;
+        return false;
+    }
+
+    if (ftruncate(shmFd, SHARED_MEMORY_SIZE) == -1)
+    {
+        cerr << "无法设置共享内存大小: " << strerror(errno) << endl;
+        close(shmFd);
+        shmFd = -1;
+        return false;
+    }
+
+    sharedData = (SharedData *)mmap(NULL, SHARED_MEMORY_SIZE,
+                                    PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+    if (sharedData == MAP_FAILED)
+    {
+        cerr << "无法映射共享内存: " << strerror(errno) << endl;
+        close(shmFd);
+        shmFd = -1;
+        return false;
+    }
+
+    // 创建信号量
+    mutex = sem_open(SHARED_MUTEX_NAME, O_CREAT, 0666, 1);
+    if (mutex == SEM_FAILED)
+    {
+        cerr << "无法创建互斥信号量: " << strerror(errno) << endl;
+        return false;
+    }
+
+    string eventName = CHANGE_EVENT_NAME + processName;
+    changeEvent = sem_open(eventName.c_str(), O_CREAT, 0666, 0);
+    if (changeEvent == SEM_FAILED)
+    {
+        cerr << "无法创建事件信号量: " << strerror(errno) << endl;
+        return false;
+    }
+
+    // 初始化共享数据
+    new (sharedData) SharedData();
+#endif
+
+    cout << "共享内存初始化成功" << endl;
+    return true;
+}
+
+bool MiniFMS::connectToSharedMemory()
+{
+#ifdef _WIN32
+    // 打开现有的共享内存
+    hMapFile = OpenFileMappingA(
+        FILE_MAP_ALL_ACCESS,
+        FALSE,
+        SHARED_MEMORY_NAME);
+
+    if (hMapFile == NULL)
+    {
+        return false; // 共享内存不存在
+    }
+
+    sharedData = (SharedData *)MapViewOfFile(
+        hMapFile,
+        FILE_MAP_ALL_ACCESS,
+        0,
+        0,
+        SHARED_MEMORY_SIZE);
+
+    if (sharedData == NULL)
+    {
+        CloseHandle(hMapFile);
+        hMapFile = NULL;
+        return false;
+    }
+
+    // 打开互斥锁
+    hMutex = OpenMutexA(SYNCHRONIZE, FALSE, SHARED_MUTEX_NAME);
+    if (hMutex == NULL)
+    {
+        return false;
+    }
+
+    // 打开事件对象
+    hChangeEvent = OpenEventA(EVENT_ALL_ACCESS, FALSE, CHANGE_EVENT_NAME);
+    if (hChangeEvent == NULL)
+    {
+        return false;
+    }
+
+#else
+    // Linux实现
+    shmFd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
+    if (shmFd == -1)
+    {
+        return false; // 共享内存不存在
+    }
+
+    sharedData = (SharedData *)mmap(NULL, SHARED_MEMORY_SIZE,
+                                    PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+    if (sharedData == MAP_FAILED)
+    {
+        close(shmFd);
+        shmFd = -1;
+        return false;
+    }
+
+    // 打开信号量
+    mutex = sem_open(SHARED_MUTEX_NAME, 0);
+    if (mutex == SEM_FAILED)
+    {
+        return false;
+    }
+
+    string eventName = CHANGE_EVENT_NAME + processName;
+    changeEvent = sem_open(eventName.c_str(), O_CREAT, 0666, 0);
+    if (changeEvent == SEM_FAILED)
+    {
+        return false;
+    }
+#endif
+
+    return true;
+}
+
+bool MiniFMS::acquireProcessSlot()
+{
+    lockSharedMemory();
+
+    for (int i = 0; i < MAX_PROCESSES; ++i)
+    {
+        if (!sharedData->processActive[i])
+        {
+            sharedData->processActive[i] = true;
+            strncpy(sharedData->processNames[i], processName.c_str(), 63);
+            sharedData->processNames[i][63] = '\0';
+            sharedData->processCount++;
+            currentProcessId = i;
+            lastKnownChangeId = sharedData->lastChangeId.load();
+
+            unlockSharedMemory();
+            cout << "获得进程槽位 " << i << " (进程名: " << processName << ")" << endl;
+            return true;
+        }
+    }
+
+    unlockSharedMemory();
+    return false;
+}
+
+void MiniFMS::releaseProcessSlot()
+{
+    if (currentProcessId >= 0)
+    {
+        lockSharedMemory();
+        sharedData->processActive[currentProcessId] = false;
+        memset(sharedData->processNames[currentProcessId], 0, 64);
+        sharedData->processCount--;
+        unlockSharedMemory();
+        cout << "释放进程槽位 " << currentProcessId << endl;
+        currentProcessId = -1;
+    }
+}
+
+void MiniFMS::lockSharedMemory()
+{
+#ifdef _WIN32
+    WaitForSingleObject(hMutex, INFINITE);
+#else
+    sem_wait(mutex);
+#endif
+}
+
+void MiniFMS::unlockSharedMemory()
+{
+#ifdef _WIN32
+    ReleaseMutex(hMutex);
+#else
+    sem_post(mutex);
+#endif
+}
+
+void MiniFMS::notifyDataChange()
+{
+    lockSharedMemory();
+    sharedData->lastChangeId++;
+    unlockSharedMemory();
+
+#ifdef _WIN32
+    SetEvent(hChangeEvent);
+#else
+    // 通知所有其他进程
+    for (int i = 0; i < MAX_PROCESSES; ++i)
+    {
+        if (i != currentProcessId && sharedData->processActive[i])
+        {
+            string eventName = CHANGE_EVENT_NAME + string(sharedData->processNames[i]);
+            sem_t *otherEvent = sem_open(eventName.c_str(), 0);
+            if (otherEvent != SEM_FAILED)
+            {
+                sem_post(otherEvent);
+                sem_close(otherEvent);
+            }
+        }
+    }
+#endif
+}
+
+void MiniFMS::syncDataChangeThread()
+{
+    while (!shouldExit)
+    {
+#ifdef _WIN32
+        DWORD result = WaitForSingleObject(hChangeEvent, 1000);
+        if (result == WAIT_OBJECT_0)
+        {
+            ResetEvent(hChangeEvent);
+
+            int currentChangeId = sharedData->lastChangeId.load();
+            if (currentChangeId > lastKnownChangeId)
+            {
+                cout << "\n[系统通知] 文件系统数据已被其他进程更新" << endl;
+                lastKnownChangeId = currentChangeId;
+            }
+        }
+#else
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 1;
+
+        int result = sem_timedwait(changeEvent, &timeout);
+        if (result == 0)
+        {
+            int currentChangeId = sharedData->lastChangeId.load();
+            if (currentChangeId > lastKnownChangeId)
+            {
+                cout << "\n[系统通知] 文件系统数据已被其他进程更新" << endl;
+                cout << "           更新ID: " << lastKnownChangeId << " -> " << currentChangeId << endl;
+                lastKnownChangeId = currentChangeId;
+            }
+        }
+#endif
+    }
+}
+
+void MiniFMS::broadcastMessage(const string &message)
+{
+    cout << "\n[广播消息] " << message << endl;
+    // 这里可以扩展为向其他进程发送消息
+}
+
+void MiniFMS::showConnectedProcesses()
+{
+    lockSharedMemory();
+
+    cout << "\n当前连接的进程:" << endl;
+    cout << "总进程数: " << sharedData->processCount.load() << endl;
+    cout << "─────────────────────────────────────" << endl;
+
+    for (int i = 0; i < MAX_PROCESSES; ++i)
+    {
+        if (sharedData->processActive[i])
+        {
+            cout << "槽位 " << i << ": " << sharedData->processNames[i];
+            if (i == currentProcessId)
+            {
+                cout << " (当前进程)";
+            }
+            cout << endl;
+        }
+    }
+
+    unlockSharedMemory();
+    cout << endl;
+}
+
 int main()
 {
 #ifdef _WIN32
     // 设置控制台编码为UTF-8
     system("chcp 65001 >nul");
+    // 控制台输出和输入
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 #endif
